@@ -29,6 +29,11 @@ def get_args():
 
     # Add beam search arguments
     parser.add_argument('--beam-size', default=5, type=int, help='number of hypotheses expanded in beam search')
+    
+    ### Lorenz: additional arguments for length penalty (alpha), n best size and diversity preference (gamma)
+    parser.add_argument('--length-penalty', default=0, type=float, help='length penalty applied on sequence score')
+    parser.add_argument('--n-best-size', default=1, type=int, help='number of candidates per sentence written to output file')
+    parser.add_argument('--diversity-preference', default=None, type=float, help='value that is multiplied with the rank and subtracted from the sequence score')
 
     return parser.parse_args()
 
@@ -74,6 +79,7 @@ def main(args):
 
         # Create a beam search object or every input sentence in batch
         batch_size = sample['src_tokens'].shape[0]
+        
         searches = [BeamSearch(args.beam_size, args.max_len - 1, tgt_dict.unk_idx) for i in range(batch_size)]
 
         with torch.no_grad():
@@ -84,14 +90,15 @@ def main(args):
 
             # Compute the decoder output at the first time step
             decoder_out, _ = model.decoder(go_slice, encoder_out)
-
+            
             # __QUESTION 1: What happens here and what do 'log_probs' and 'next_candidates' contain?
             log_probs, next_candidates = torch.topk(torch.log(torch.softmax(decoder_out, dim=2)),
                                                     args.beam_size+1, dim=-1)
-
+            
         # Create number of beam_size beam search nodes for every input sentence
         for i in range(batch_size):
             for j in range(args.beam_size):
+                
                 # __QUESTION 2: Why do we need backoff candidates?
                 best_candidate = next_candidates[i, :, j]
                 backoff_candidate = next_candidates[i, :, j+1]
@@ -99,7 +106,7 @@ def main(args):
                 backoff_log_p = log_probs[i, :, j+1]
                 next_word = torch.where(best_candidate == tgt_dict.unk_idx, backoff_candidate, best_candidate)
                 log_p = torch.where(best_candidate == tgt_dict.unk_idx, backoff_log_p, best_log_p)
-                log_p = log_p[-1]
+                log_p = log_p[-1]                
 
                 # Store the encoder_out information for the current input sentence and beam
                 emb = encoder_out['src_embeddings'][:,i,:]
@@ -117,7 +124,7 @@ def main(args):
                 searches[i].add(-node.eval(), node)
 
         # Start generating further tokens until max sentence length reached
-        for _ in range(args.max_len-1):
+        for i in range(args.max_len-1):
 
             # Get the current nodes to expand
             nodes = [n[1] for s in searches for n in s.get_current_beams()]
@@ -155,6 +162,11 @@ def main(args):
                     next_word = torch.where(best_candidate == tgt_dict.unk_idx, backoff_candidate, best_candidate)
                     log_p = torch.where(best_candidate == tgt_dict.unk_idx, backoff_log_p, best_log_p)
                     log_p = log_p[-1]
+                    
+                    ### Lorenz: re-calculate log score if diversity preference penalty (gamma) is set
+                    if args.diversity_preference:
+                        log_p = log_p - ((j + 1) * args.diversity_preference)
+                        
                     next_word = torch.cat((prev_words[i][1:], next_word[-1:]))
 
                     # Get parent node and beam search object for corresponding sentence
@@ -168,7 +180,10 @@ def main(args):
                         node = BeamSearchNode(search, node.emb, node.lstm_out, node.final_hidden,
                                               node.final_cell, node.mask, torch.cat((prev_words[i][0].view([1]),
                                               next_word)), node.logp, node.length)
-                        search.add_final(-node.eval(), node)
+                        
+                        ### Lorenz: add length penalty to final score
+                        #search.add_final(-node.eval(), node)
+                        search.add_final(-node.eval(), node, args.length_penalty)
 
                     # Add the node to current nodes for next iteration
                     else:
@@ -183,9 +198,12 @@ def main(args):
                 search.prune()
 
         # Segment into sentences
-        best_sents = torch.stack([search.get_best()[1].sequence[1:] for search in searches])
+        
+        ### Lorenz: process n best candidates per sentence
+        #best_sents = torch.stack([search.get_best()[1].sequence[1:] for search in searches])
+        best_sents = torch.stack([sent[1].sequence[1:] for search in searches for sent in search.get_best(args.n_best_size)])
+        
         decoded_batch = best_sents.numpy()
-
         output_sentences = [decoded_batch[row, :] for row in range(decoded_batch.shape[0])]
 
         # __QUESTION 6: What is the purpose of this for loop?
@@ -200,16 +218,18 @@ def main(args):
 
         # Convert arrays of indices into strings of words
         output_sentences = [tgt_dict.string(sent) for sent in output_sentences]
-
-        for ii, sent in enumerate(output_sentences):
-            all_hyps[int(sample['id'].data[ii])] = sent
-
+        
+        ### Lorenz: store list of n candidates at corresponding sentence id
+        all_hyps[int(sample['id'].data[0])] = output_sentences
 
     # Write to file
     if args.output is not None:
         with open(args.output, 'w') as out_file:
             for sent_id in range(len(all_hyps.keys())):
-                out_file.write(all_hyps[sent_id] + '\n')
+                
+                ### Lorenz: additional for loop to iterate over n candidates
+                for sent in all_hyps[sent_id]:
+                    out_file.write(sent + '\n')
 
 
 if __name__ == '__main__':
