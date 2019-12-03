@@ -21,11 +21,16 @@ class BeamSearch(object):
         """ Adds a new beam search node to the queue of current nodes """
         self.nodes.put((score, next(self._counter), node))
 
-    def add_final(self, score, node):
+    def add_final(self, score, node, length_penalty):
         """ Adds a beam search path that ended in EOS (= finished sentence) """
+        """ Lorenz: additional parameter "length_penalty" """
         # ensure all node paths have the same length for batch ops
         missing = self.max_len - node.length
         node.sequence = torch.cat((node.sequence, torch.tensor([self.pad]*missing).long()))
+                
+        ### Lorenz: calculate final score with length penalty
+        score = score / (node.length ** length_penalty)
+        
         self.final.put((score, next(self._counter), node))
 
     def get_current_beams(self):
@@ -35,24 +40,32 @@ class BeamSearch(object):
             node = self.nodes.get()
             nodes.append((node[0], node[2]))
         return nodes
-
-    def get_best(self):
-        """ Returns final node with the lowest negative log probability """
+    
+    
+    def get_best(self, n):
+        """ Returns n best final nodes with the lowest negative log probability """
+        
+        ### Lorenz: additional parameter "n" to return n best candidates
+        
         # Merge EOS paths and those that were stopped by
         # max sequence length (still in nodes)
         merged = PriorityQueue()
         for _ in range(self.final.qsize()):
             node = self.final.get()
             merged.put(node)
-
+        
         for _ in range(self.nodes.qsize()):
             node = self.nodes.get()
             merged.put(node)
-
-        node = merged.get()
-        node = (node[0], node[2])
-
-        return node
+        
+        ### Lorenz: collect n best candidates
+        n_best = list()
+        for _ in range(n):
+            node = merged.get()
+            node = (node[0], node[2])
+            n_best.append(node)
+        
+        return n_best
 
     def prune(self):
         """ Removes all nodes but the beam_size best ones (lowest neg log prob) """
@@ -85,4 +98,5 @@ class BeamSearchNode(object):
 
     def eval(self):
         """ Returns score of sequence up to this node """
+        # add gamma calculation here
         return self.logp
